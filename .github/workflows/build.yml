@@ -1,0 +1,51 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*" # 只有打标签 (如 v0.0.1) 时才触发发布
+  workflow_dispatch: # 允许手动点击按钮触发
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl # 编译为静态链接版本
+
+      - name: Install Musl tools
+        run: sudo apt-get install -y musl-tools
+
+      - name: Build Release
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Prepare Artifact
+        run: |
+          mkdir release
+          cp target/x86_64-unknown-linux-musl/release/aizasy_gateway release/
+          cd release
+          # 压缩一下体积 (可选)
+          tar -czvf aizasy_gateway_linux_amd64.tar.gz aizasy_gateway
+
+      - name: Upload Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: release/aizasy_gateway_linux_amd64.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Upload Artifact (For manual trigger)
+        uses: actions/upload-artifact@v4
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        with:
+          name: aizasy_gateway_linux_amd64
+          path: target/x86_64-unknown-linux-musl/release/aizasy_gateway
