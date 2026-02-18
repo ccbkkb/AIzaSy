@@ -1,0 +1,19 @@
+[package]
+name = "aizasy_gateway"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web 框架
+axum = "0.7"
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+# HTTP 客户端 (开启 socks 和 rustls 是关键)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
+# 命令行与环境变量解析 (开启 env 特性)
+clap = { version = "4", features = ["derive", "env"] }
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 字节处理
+bytes = "1"
