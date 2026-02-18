@@ -1,12 +1,13 @@
 use axum::{
     body::Body,
-    extract::{State},
+    extract::{State, Request},
     http::{HeaderMap, Method, Uri, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get},
     Router,
 };
 use clap::Parser;
+use futures_util::TryStreamExt; // 关键：让流支持 map_err
 use reqwest::{Client, Proxy};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,27 +15,22 @@ use std::time::Duration;
 use tracing::{error, info, warn, debug};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-// --- 配置结构体 ---
+// --- 配置部分 ---
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Aizasy High-Perf Gateway")]
 struct Args {
-    /// 监听地址
     #[arg(short, long, env = "AIZASY_LISTEN", default_value = "0.0.0.0:3000")]
     listen: String,
 
-    /// SOCKS5 代理地址
     #[arg(short, long, env = "AIZASY_PROXY")]
     proxy: Option<String>,
 
-    /// 目标 API 地址
     #[arg(short, long, env = "AIZASY_TARGET", default_value = "https://generativelanguage.googleapis.com")]
     target: String,
 
-    /// 忽略 SSL 证书验证
     #[arg(long, env = "AIZASY_INSECURE", default_value = "false")]
     insecure: bool,
 
-    /// 日志级别
     #[arg(long, env = "AIZASY_LOG", default_value = "info")]
     log_level: String,
 }
@@ -55,36 +51,31 @@ async fn main() {
         .with(tracing_subscriber::EnvFilter::new(args.log_level.clone()))
         .init();
 
-    info!("🚀 启动 Aizasy 高性能网关 (Stable Build)...");
-    info!("⚙️  监听: {}", args.listen);
-    info!("🎯 目标: {}", args.target);
+    info!("🚀 启动 Aizasy 流式网关 (Stream Mode)...");
 
-    // --- 高性能 Client 构建 ---
+    // --- 构建高性能 Client ---
     let mut client_builder = Client::builder()
-        // 连接池优化: 保持 50 个长连接，空闲 90 秒回收
+        // 1. 连接池调优：保持 50 个长连接，空闲 90 秒回收
         .pool_idle_timeout(Duration::from_secs(90))
-        .pool_max_idle_per_host(50) 
-        // TCP 优化: 禁用 Nagle 算法，降低 API 延迟
+        .pool_max_idle_per_host(50)
+        // 2. TCP 调优：禁用 Nagle 算法，降低 API 延迟
         .tcp_nodelay(true)
-        // 超时设置
+        // 3. 超时设置：连接 10s，传输不设硬限(为了流式)，但可设 keepalive
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(120)) 
-        // 不自动解压 gzip，透传数据以降低 CPU 负载
-        .no_gzip(); 
+        .http2_keep_alive_interval(Duration::from_secs(20))
+        // 4. 关键：禁用自动 gzip 解压，直接透传二进制流，极大降低 CPU 消耗
+        .no_gzip();
 
+    // 代理配置
     if let Some(proxy_url) = &args.proxy {
         info!("🔌 启用代理: {}", proxy_url);
-        match Proxy::all(proxy_url) {
-            Ok(proxy) => { client_builder = client_builder.proxy(proxy); }
-            Err(e) => {
-                error!("❌ 代理配置无效: {}", e);
-                std::process::exit(1);
-            }
-        }
+        let proxy = Proxy::all(proxy_url).expect("代理地址格式错误");
+        client_builder = client_builder.proxy(proxy);
     }
 
+    // 忽略 SSL
     if args.insecure {
-        warn!("⚠️  已开启【忽略 SSL 验证】模式");
+        warn!("⚠️  警告：已忽略 SSL 证书验证！");
         client_builder = client_builder.danger_accept_invalid_certs(true);
     }
 
@@ -101,50 +92,62 @@ async fn main() {
         .route("/", any(proxy_handler))
         .with_state(state);
 
-    let addr: SocketAddr = args.listen.parse().expect("无效的监听地址");
-    
+    let addr: SocketAddr = args.listen.parse().expect("Invalid address");
+    info!("🎧 监听于: {}", addr);
+
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // 优雅关闭支持
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
 }
 
 async fn health_check() -> impl IntoResponse {
-    (StatusCode::OK, "Aizasy Gateway is running!")
+    (StatusCode::OK, "Aizasy Gateway is running (Stream Mode)")
 }
 
+// --- 核心处理逻辑 ---
 async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     method: Method,
     headers: HeaderMap,
     uri: Uri,
-    req_body: Body,
+    req: Request<Body>, // 获取原始 Request 以便提取 Body Stream
 ) -> impl IntoResponse {
-    let path = uri.path_and_query().map(|x| x.as_str()).unwrap_or("/");
+    let path = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("/");
     let target_uri = format!("{}{}", state.target_url, path);
 
-    // --- 修复编译错误的关键 ---
-    // Axum Body -> Bytes (内存缓冲) -> Reqwest Body
-    // 限制最大 16MB，防止恶意大包攻击
-    let req_bytes = match axum::body::to_bytes(req_body, 16 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(e) => {
-            error!("❌ 读取请求体失败: {}", e);
-            return (StatusCode::BAD_REQUEST, "Body too large or invalid").into_response();
-        }
-    };
-
+    // --- 1. 处理请求头 ---
     let mut new_headers = headers.clone();
     new_headers.remove("host");
     new_headers.remove("cf-connecting-ip");
     new_headers.remove("cf-ipcountry");
     new_headers.remove("x-forwarded-for");
-    
+    // 移除 content-length，因为如果是 http2 流式传输，长度可能是未知的
+    // reqwest 会自动根据 body 类型决定是加 content-length 还是 chunked
+    new_headers.remove("content-length");
+
     debug!("-> {} {}", method, target_uri);
 
-    // Bytes 实现了 Into<reqwest::Body>，所以这里绝对能编译通过
+    // --- 2. 真正优雅的流式转换 (Zero-Copy) ---
+    // Axum Body -> Data Stream -> IO Error Mapped Stream -> Reqwest Body
+    let req_body = req.into_body();
+    
+    // into_data_stream() 提取数据帧，忽略 Trailers
+    // map_err 将 Axum 的错误转换为 std::io::Error，这是 Reqwest 接受流的前提
+    let stream = req_body.into_data_stream().map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, e)
+    });
+
+    // 将流封装为 Reqwest Body
+    let reqwest_body = reqwest::Body::wrap_stream(stream);
+
+    // --- 3. 发送请求 ---
     let request_builder = state.client
         .request(method, target_uri)
         .headers(new_headers)
-        .body(req_bytes); 
+        .body(reqwest_body); // 这里传入的是流，不是内存块
 
     match request_builder.send().await {
         Ok(response) => {
@@ -153,8 +156,9 @@ async fn proxy_handler(
             for (k, v) in response.headers() {
                 resp_headers.insert(k, v.clone());
             }
-            
-            // 响应依然是流式的，这才是最关键的（因为 Google 回复可能很长）
+
+            // --- 4. 响应流式透传 ---
+            // 同样，这里直接把 Reqwest 的下载流丢给 Axum 的响应
             let resp_stream = response.bytes_stream();
             let body = Body::from_stream(resp_stream);
             
@@ -165,4 +169,30 @@ async fn proxy_handler(
             (StatusCode::BAD_GATEWAY, format!("Proxy Error: {}", e)).into_response()
         }
     }
+}
+
+// 优雅关闭信号监听
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    info!("🛑 正在关闭服务...");
 }
