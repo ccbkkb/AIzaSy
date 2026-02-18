@@ -7,7 +7,6 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use futures_util::TryStreamExt; // 关键：让流可以被转换
 use reqwest::{Client, Proxy};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -31,7 +30,7 @@ struct Args {
     #[arg(short, long, env = "AIZASY_TARGET", default_value = "https://generativelanguage.googleapis.com")]
     target: String,
 
-    /// 忽略 SSL 证书验证 (用于自签证书场景)
+    /// 忽略 SSL 证书验证
     #[arg(long, env = "AIZASY_INSECURE", default_value = "false")]
     insecure: bool,
 
@@ -56,26 +55,23 @@ async fn main() {
         .with(tracing_subscriber::EnvFilter::new(args.log_level.clone()))
         .init();
 
-    info!("🚀 启动 Aizasy 高性能网关...");
+    info!("🚀 启动 Aizasy 高性能网关 (Stable Build)...");
     info!("⚙️  监听: {}", args.listen);
     info!("🎯 目标: {}", args.target);
 
     // --- 高性能 Client 构建 ---
     let mut client_builder = Client::builder()
-        // 1. 连接池配置 (复用连接，减少握手)
+        // 连接池优化: 保持 50 个长连接，空闲 90 秒回收
         .pool_idle_timeout(Duration::from_secs(90))
-        .pool_max_idle_per_host(50) // 针对 Google 保持 50 个长连接
-        // 2. TCP 层面优化
-        .tcp_keepalive(Duration::from_secs(60))
+        .pool_max_idle_per_host(50) 
+        // TCP 优化: 禁用 Nagle 算法，降低 API 延迟
         .tcp_nodelay(true)
-        // 3. 超时设置
+        // 超时设置
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(120)) // 总超时，流式传输需要长一点
-        // 4. HTTP2 支持
-        .http2_keep_alive_interval(Duration::from_secs(20))
-        .no_gzip(); // 透传压缩数据，减少 CPU 消耗
+        .timeout(Duration::from_secs(120)) 
+        // 不自动解压 gzip，透传数据以降低 CPU 负载
+        .no_gzip(); 
 
-    // 配置代理
     if let Some(proxy_url) = &args.proxy {
         info!("🔌 启用代理: {}", proxy_url);
         match Proxy::all(proxy_url) {
@@ -87,9 +83,8 @@ async fn main() {
         }
     }
 
-    // 配置 SSL 忽略
     if args.insecure {
-        warn!("⚠️  已开启【忽略 SSL 验证】模式，请确保你了解安全风险！");
+        warn!("⚠️  已开启【忽略 SSL 验证】模式");
         client_builder = client_builder.danger_accept_invalid_certs(true);
     }
 
@@ -121,20 +116,22 @@ async fn proxy_handler(
     method: Method,
     headers: HeaderMap,
     uri: Uri,
-    req_body: Body, // Axum Body
+    req_body: Body,
 ) -> impl IntoResponse {
     let path = uri.path_and_query().map(|x| x.as_str()).unwrap_or("/");
     let target_uri = format!("{}{}", state.target_url, path);
 
-    // --- 核心优化: 零拷贝流式转换 ---
-    // 将 Axum 的 Body Stream 映射为 Reqwest 可接受的 Stream
-    // 这样数据来多少发多少，不占用网关内存
-    let req_stream = req_body.into_data_stream().map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    });
-    let reqwest_body = reqwest::Body::wrap_stream(req_stream);
+    // --- 修复编译错误的关键 ---
+    // Axum Body -> Bytes (内存缓冲) -> Reqwest Body
+    // 限制最大 16MB，防止恶意大包攻击
+    let req_bytes = match axum::body::to_bytes(req_body, 16 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            error!("❌ 读取请求体失败: {}", e);
+            return (StatusCode::BAD_REQUEST, "Body too large or invalid").into_response();
+        }
+    };
 
-    // Header 清洗
     let mut new_headers = headers.clone();
     new_headers.remove("host");
     new_headers.remove("cf-connecting-ip");
@@ -143,11 +140,11 @@ async fn proxy_handler(
     
     debug!("-> {} {}", method, target_uri);
 
-    // 发起请求
+    // Bytes 实现了 Into<reqwest::Body>，所以这里绝对能编译通过
     let request_builder = state.client
         .request(method, target_uri)
         .headers(new_headers)
-        .body(reqwest_body); // 直接传入流
+        .body(req_bytes); 
 
     match request_builder.send().await {
         Ok(response) => {
@@ -157,7 +154,7 @@ async fn proxy_handler(
                 resp_headers.insert(k, v.clone());
             }
             
-            // 响应体也是流式的
+            // 响应依然是流式的，这才是最关键的（因为 Google 回复可能很长）
             let resp_stream = response.bytes_stream();
             let body = Body::from_stream(resp_stream);
             
