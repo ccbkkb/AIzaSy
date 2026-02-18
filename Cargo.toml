@@ -8,15 +8,12 @@ edition = "2021"
 axum = "0.7"
 # 异步运行时
 tokio = { version = "1", features = ["full"] }
-# HTTP 客户端 (开启 socks, rustls, stream, h2)
+# HTTP 客户端 (开启 socks, rustls, http2)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks", "http2"] }
 # 命令行参数
 clap = { version = "4", features = ["derive", "env"] }
 # 日志
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# 关键：用于流式处理
-futures-util = "0.3"
-# 错误处理
-anyhow = "1.0"
+# 字节处理
 bytes = "1"
